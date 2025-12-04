@@ -1,0 +1,338 @@
+---
+# PLAY 1: Prepare ALL nodes (masters and workers)
+- name: Prepare all nodes for Kubernetes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name:
+          - containerd
+          - apt-transport-https
+          - ca-certificates
+        state: present
+
+    - name: Create containerd config directory
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+
+    - name: Configure containerd to use 'systemd' cgroup driver
+      ansible.builtin.shell:
+        cmd: |
+          containerd config default > /etc/containerd/config.toml
+          sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+        enabled: yes
+
+    - name: Disable swap
+      ansible.builtin.shell: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Comment out swap in /etc/fstab
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^(\s*UUID=.*swap\s+.*)$'
+        replace: '# \1'
+
+    - name: Load required kernel modules
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Load overlay module
+      community.general.modprobe:
+        name: overlay
+        state: present
+
+    - name: Load br_netfilter module
+      community.general.modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Set sysctl parameters for Kubernetes
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+
+    - name: Apply sysctl parameters
+      ansible.builtin.shell:
+        cmd: sysctl --system
+
+    - name: Create keyrings directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes apt-key
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+
+    - name: Update apt cache (after adding repo)
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Install kubelet, kubeadm, kubectl
+      ansible.builtin.apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes package versions
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+# PLAY 2: Initialize the Control Plane (on master-1 ONLY)
+- name: Initialize Kubernetes Control Plane
+  hosts: masters[0]
+  become: yes
+  tasks:
+    - name: Check if cluster is already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_initialized
+
+    - name: Add NLB DNS to /etc/hosts pointing to localhost
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "127.0.0.1 {{ control_plane_endpoint }}"
+        state: present
+
+    - name: Initialize the cluster
+      ansible.builtin.shell:
+        cmd: |
+          kubeadm init \
+            --pod-network-cidr=192.168.0.0/16 \
+            --control-plane-endpoint={{ control_plane_endpoint }}:6443 \
+            --upload-certs
+      when: not k8s_initialized.stat.exists
+      register: kubeadm_init
+
+    - name: Create .kube directory for 'ubuntu' user
+      ansible.builtin.file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy admin.conf to 'ubuntu' user's .kube directory
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: yes
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+    - name: Wait for API server to be fully ready
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Wait for kube-apiserver pod to be ready
+      ansible.builtin.shell:
+        cmd: kubectl wait --for=condition=ready pod -l component=kube-apiserver -n kube-system --timeout=120s
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      become_user: ubuntu
+      register: apiserver_ready
+      until: apiserver_ready.rc == 0
+      retries: 3
+      delay: 10
+
+    - name: Allow anonymous access to cluster-info for join operations
+      ansible.builtin.shell:
+        cmd: |
+          kubectl create clusterrolebinding kubeadm:get-cluster-info \
+            --clusterrole=system:public-info-viewer \
+            --group=system:unauthenticated \
+            --group=system:authenticated
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      become_user: ubuntu
+      register: crb_result
+      failed_when: 
+        - crb_result.rc != 0
+        - '"already exists" not in crb_result.stderr'
+
+    - name: Verify ClusterRoleBinding exists
+      ansible.builtin.shell:
+        cmd: kubectl get clusterrolebinding kubeadm:get-cluster-info -o yaml
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      become_user: ubuntu
+      register: crb_output
+
+    - name: Display ClusterRoleBinding for verification
+      ansible.builtin.debug:
+        var: crb_output.stdout_lines
+
+    - name: Upload certificates and get certificate key
+      ansible.builtin.shell:
+        cmd: kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -n1
+      register: cert_key_output
+
+    - name: Get the join command for other masters
+      ansible.builtin.shell:
+        cmd: kubeadm token create --print-join-command --certificate-key {{ cert_key_output.stdout }}
+      register: master_join_command
+
+    - name: Get the join command for workers
+      ansible.builtin.shell:
+        cmd: kubeadm token create --print-join-command
+      register: worker_join_command
+
+    - name: Store join commands for other hosts
+      ansible.builtin.set_fact:
+        master_join: "{{ master_join_command.stdout }}"
+        worker_join: "{{ worker_join_command.stdout }}"
+
+    # DON'T remove /etc/hosts yet - keep it for other masters to join
+
+# PLAY 3: Join the other masters
+- name: Join other masters
+  hosts: masters[1:]
+  become: yes
+  tasks:
+    - name: Check if node is already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: node_joined
+
+    - name: Display join command for debugging
+      ansible.builtin.debug:
+        msg: "Join command: {{ hostvars[groups['masters'][0]]['master_join'] }}"
+      when: not node_joined.stat.exists
+
+    - name: Join the cluster as a control-plane node
+      ansible.builtin.shell:
+        cmd: "{{ hostvars[groups['masters'][0]]['master_join'] }}"
+      when: not node_joined.stat.exists
+      register: join_result
+      retries: 3
+      delay: 15
+      until: join_result.rc == 0
+
+    - name: Create .kube directory for 'ubuntu' user
+      ansible.builtin.file:
+        path: /home/ubuntu/.kube
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy admin.conf to 'ubuntu' user's .kube directory
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: yes
+        owner: ubuntu
+        group: ubuntu
+        mode: '0644'
+
+# PLAY 3.5: Remove /etc/hosts after all masters joined and wait for NLB
+- name: Finalize master setup
+  hosts: masters[0]
+  become: yes
+  tasks:
+    - name: Remove NLB DNS from /etc/hosts after all masters joined
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "127.0.0.1 {{ control_plane_endpoint }}"
+        state: absent
+
+    - name: Wait for NLB to mark all masters as healthy
+      ansible.builtin.pause:
+        seconds: 60
+
+# PLAY 4: Install Calico CNI (after all masters are joined)
+- name: Install CNI Network Plugin
+  hosts: masters[0]
+  become: yes
+  tasks:
+    - name: Check if Calico is already installed
+      ansible.builtin.shell:
+        cmd: kubectl get pods -n kube-system -l k8s-app=calico-node --no-headers 2>/dev/null | wc -l
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      become_user: ubuntu
+      register: calico_pods
+      ignore_errors: yes
+
+    - name: Install Calico CNI
+      ansible.builtin.shell:
+        cmd: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.3/manifests/calico.yaml --validate=false --request-timeout=60s
+      environment:
+        KUBECONFIG: /home/ubuntu/.kube/config
+      become_user: ubuntu
+      when: calico_pods.stdout == "0"
+      register: calico_install
+      retries: 3
+      delay: 10
+      until: calico_install.rc == 0
+
+    - name: Wait briefly for Calico to start deploying
+      ansible.builtin.pause:
+        seconds: 30
+      when: calico_pods.stdout == "0"
+
+# PLAY 5: Join the workers
+- name: Join worker nodes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Check if node is already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: node_joined
+
+    - name: Join the cluster as a worker node
+      ansible.builtin.shell:
+        cmd: "{{ hostvars[groups['masters'][0]]['worker_join'] }}"
+      when: not node_joined.stat.exists
+      register: join_result
+      retries: 3
+      delay: 10
+      until: join_result.rc == 0
+
+# PLAY 6: Fetch the kubeconfig file
+- name: Fetch admin.conf to local machine
+  hosts: masters[0]
+  tasks:
+    - name: Fetch the Kubeconfig file
+      ansible.builtin.fetch:
+        src: /home/ubuntu/.kube/config
+        dest: ./kubeconfig
+        flat: yes
